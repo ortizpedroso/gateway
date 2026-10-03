@@ -1,0 +1,384 @@
+// ============================================================================
+// PayHub White-Label Payment Gateway — Prisma Schema (PostgreSQL)
+// Core domain: Merchants (subcontas Asaas), API Keys, Charges, Subscriptions,
+// Payment Links, Invoices (NFS-e/NF-e) and Webhook idempotency log.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum MerchantStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+enum ApiKeyEnvironment {
+  TEST
+  LIVE
+}
+
+enum BillingType {
+  PIX
+  CREDIT_CARD
+  BOLETO
+}
+
+enum ChargeStatus {
+  PENDING
+  CONFIRMED
+  OVERDUE
+  REFUNDED
+  CANCELLED
+  RECEIVED // aguardando compensação (PIX_RECEIVED / boleto pago)
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  INACTIVE
+  PENDING
+  CANCELLED
+}
+
+enum RecurrenceInterval {
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+  QUARTERLY
+  SEMIANNUAL
+  YEARLY
+}
+
+enum InvoiceStatus {
+  DRAFT
+  QUEUED
+  ISSUED
+  ERROR
+  CANCELLED
+}
+
+enum WebhookDirection {
+  INBOUND // Asaas -> PayHub
+  OUTBOUND // PayHub -> Loja do merchant
+}
+
+enum WebhookDeliveryStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  SKIPPED_DUPLICATE
+  PENDING
+  DELIVERED
+}
+
+enum KycDocumentType {
+  CONTRACT
+  SIMPLIFIED_STATEMENT
+  ARTICLES_OF_INCORPORATION
+  BANK_PROOF
+  SOCIAL_CONTRACT
+  OTHER
+}
+
+// ---------------------------------------------------------------------------
+// Merchant (lojista / prestador — dono de uma subconta Asaas)
+// ---------------------------------------------------------------------------
+
+model Merchant {
+  id        String  @id @default(cuid())
+  // Identidade white-label
+  tradeName String // nome fantasia exibido ao pagador final
+  legalName String // razão social
+  document  String  @unique // CNPJ/CPF somente dígitos
+  email     String  @unique
+  phone     String?
+  website   String?
+  city      String?
+  state     String?
+  zipCode   String?
+
+  // Vínculo com a subconta Asaas (nunca exposto ao pagador final)
+  asaasAccountId       String? @unique @map("asaas_account_id")
+  asaasApiKeyEncrypted String? @map("asaas_api_key_encrypted") // AES-256-GCM
+  asaasWebhookId       String? @map("asaas_webhook_id")
+
+  status          MerchantStatus @default(PENDING)
+  kycReviewedAt   DateTime?
+  kycRejectReason String?
+
+  // Taxas da plataforma (spread/split) em basis points (ex.: 299 = 2,99%)
+  platformFeeBps    Int @default(299) @map("platform_fee_bps")
+  transferDelayDays Int @default(0)
+
+  // Webhook de saída para notificar a loja do lojista
+  webhookUrl    String? @map("webhook_url")
+  webhookSecret String? @map("webhook_secret") // HMAC-SHA256
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  apiKeys       ApiKey[]
+  customers     Customer[]
+  charges       Charge[]
+  subscriptions Subscription[]
+  paymentLinks  PaymentLink[]
+  invoices      Invoice[]
+  webhookEvents WebhookEvent[]
+  kycDocuments  KycDocument[]
+
+  @@index([status])
+  @@map("merchants")
+}
+
+model KycDocument {
+  id          String          @id @default(cuid())
+  merchantId  String
+  merchant    Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  type        KycDocumentType
+  fileName    String
+  mimeType    String
+  sizeBytes   Int
+  asaasFileId String?         @map("asaas_file_id")
+  uploadedAt  DateTime        @default(now())
+
+  @@index([merchantId])
+  @@map("kyc_documents")
+}
+
+// ---------------------------------------------------------------------------
+// ApiKey — pública (pk_live_...) e secreta (sk_live_...) com hash seguro
+// ---------------------------------------------------------------------------
+
+model ApiKey {
+  id          String            @id @default(cuid())
+  merchantId  String
+  merchant    Merchant          @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  environment ApiKeyEnvironment @default(LIVE)
+  type        String // "public" | "secret"
+  // Secret keys: armazenamos apenas o SHA-256. Public keys: valor em claro
+  // (precisamos recuperar pk para resolver o merchant no checkout).
+  prefix      String // ex.: "sk_live_a1b2" — primeiros chars para identificação
+  hashedKey   String?           @unique @map("hashed_key") // sha256 hex (secret)
+  publicKey   String?           @unique @map("public_key") // pk_live_... (plain)
+  last4       String?
+  name        String            @default("Default")
+  revokedAt   DateTime?
+  lastUsedAt  DateTime?
+  createdAt   DateTime          @default(now())
+
+  @@index([merchantId])
+  @@map("api_keys")
+}
+
+// ---------------------------------------------------------------------------
+// Customer — pagador final, isolado por merchant
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id              String   @id @default(cuid())
+  merchantId      String
+  merchant        Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  asaasCustomerId String?  @unique @map("asaas_customer_id")
+  externalRef     String? // id do cliente no e-commerce do lojista
+  name            String
+  email           String
+  phone           String?
+  document        String? // CPF/CNPJ
+  cep             String?
+  addressStreet   String?
+  addressNumber   String?
+  addressCity     String?
+  addressState    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  charges       Charge[]
+  subscriptions Subscription[]
+
+  @@unique([merchantId, email])
+  @@index([merchantId, externalRef])
+  @@map("customers")
+}
+
+// ---------------------------------------------------------------------------
+// Charge — cobrança avulsa (Pix / Cartão / Boleto)
+// ---------------------------------------------------------------------------
+
+model Charge {
+  id             String        @id @default(cuid())
+  merchantId     String
+  merchant       Merchant      @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  customerId     String?
+  customer       Customer?     @relation(fields: [customerId], references: [id])
+  paymentLinkId  String?
+  paymentLink    PaymentLink?  @relation(fields: [paymentLinkId], references: [id])
+  subscriptionId String?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+
+  // Idempotência fornecida pelo lojista (header Idempotency-Key ou external_id)
+  idempotencyKey    String? @map("idempotency_key")
+  externalReference String? // order id na loja do lojista
+
+  billingType BillingType
+  status      ChargeStatus @default(PENDING)
+
+  grossAmount  Decimal @db.Decimal(12, 2) // valor bruto cobrado
+  platformFee  Decimal @default(0) @db.Decimal(12, 2) // taxa da plataforma
+  netAmount    Decimal @default(0) @db.Decimal(12, 2) // líquido a receber
+  installments Int     @default(1) // 1..12 no cartão
+  description  String?
+
+  // Identificadores Asaas (internos — nunca retornados ao pagador final)
+  asaasPaymentId  String? @unique @map("asaas_payment_id")
+  asaasInvoiceUrl String? @map("asaas_invoice_url") // boleto PDF
+  pixQrCode       String? @map("pix_qr_code") @db.Text // copia-e-cola
+  pixCopiaECola   String? @db.Text
+  digitableLine   String? @map("digitable_line") // linha digitável boleto
+  barcode         String?
+
+  dueDate     DateTime?
+  paidAt      DateTime?
+  confirmedAt DateTime?
+  refundedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoices      Invoice[]
+  webhookEvents WebhookEvent[]
+
+  @@unique([merchantId, idempotencyKey])
+  @@index([merchantId, status])
+  @@index([merchantId, createdAt])
+  @@map("charges")
+}
+
+// ---------------------------------------------------------------------------
+// Subscription — recorrência (POST /v3/subscriptions no Asaas)
+// ---------------------------------------------------------------------------
+
+model Subscription {
+  id         String   @id @default(cuid())
+  merchantId String
+  merchant   Merchant @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  name        String // "Personal trainer - plano mensal"
+  status      SubscriptionStatus @default(PENDING)
+  billingType BillingType
+  value       Decimal            @db.Decimal(12, 2)
+  recurrence  RecurrenceInterval @default(MONTHLY)
+  nextDueDate DateTime?
+  cycleCount  Int                @default(0)
+  maxCycles   Int? // null = infinito
+
+  asaasSubscriptionId String?   @unique @map("asaas_subscription_id")
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  cancelledAt         DateTime?
+
+  charges Charge[]
+
+  @@index([merchantId, status])
+  @@map("subscriptions")
+}
+
+// ---------------------------------------------------------------------------
+// PaymentLink — link compartilhável (/pay/{slug})
+// ---------------------------------------------------------------------------
+
+model PaymentLink {
+  id                String    @id @default(cuid())
+  merchantId        String
+  merchant          Merchant  @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  slug              String    @unique // /pay/{slug}
+  title             String
+  description       String?
+  amount            Decimal   @db.Decimal(12, 2)
+  allowCustomAmount Boolean   @default(false)
+  availableMethods  Json      @default("[\"PIX\",\"CREDIT_CARD\",\"BOLETO\"]") // string[]
+  maxInstallments   Int       @default(12)
+  // Configuração de taxas repassadas ao pagador, definida pelo merchant:
+  // { "installmentInterestBps": 199 } etc.
+  feeConfig         Json?
+  dueDate           DateTime?
+  active            Boolean   @default(true)
+  asaasLinkUrl      String?   @map("asaas_link_url") // URL interna Asaas (não exibida)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  charges Charge[]
+
+  @@index([merchantId, active])
+  @@map("payment_links")
+}
+
+// ---------------------------------------------------------------------------
+// Invoice — nota fiscal (NFS-e/NF-e) via driver fiscal (Focus NFe/PlugNotas)
+// ---------------------------------------------------------------------------
+
+model Invoice {
+  id         String   @id @default(cuid())
+  merchantId String
+  merchant   Merchant @relation(fields: [merchantId], references: [id])
+  chargeId   String?
+  charge     Charge?  @relation(fields: [chargeId], references: [id])
+
+  status       InvoiceStatus @default(DRAFT)
+  provider     String // "focusnfe" | "plugnotas" | "enotas"
+  number       String? // número da NFS-e
+  key          String? // chave de acesso
+  xmlUrl       String?       @db.Text
+  pdfUrl       String?       @db.Text
+  cancelReason String?
+  issuedAt     DateTime?
+  errorMessage String?
+  payload      Json? // request enviada ao provedor fiscal (debug)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([merchantId, status])
+  @@index([chargeId])
+  @@map("invoices")
+}
+
+// ---------------------------------------------------------------------------
+// WebhookEvent — idempotência de entrada (Asaas) e log de saída (HMAC)
+// ---------------------------------------------------------------------------
+
+model WebhookEvent {
+  id         String           @id @default(cuid())
+  direction  WebhookDirection
+  merchantId String?
+  merchant   Merchant?        @relation(fields: [merchantId], references: [id])
+  chargeId   String?
+  charge     Charge?          @relation(fields: [chargeId], references: [id])
+
+  event       String // PAYMENT_RECEIVED, ACCOUNT_STATUS_CHANGED, ...
+  // Chave de deduplicação: inbound => `${event}:${asaasEventId||paymentId}`
+  dedupeKey   String                @unique @map("dedupe_key")
+  payload     Json
+  status      WebhookDeliveryStatus @default(RECEIVED)
+  attempts    Int                   @default(0)
+  lastError   String?
+  signature   String? // hmac enviado (outbound)
+  deliveredAt DateTime?
+  processedAt DateTime?
+  createdAt   DateTime              @default(now())
+
+  @@index([direction, event])
+  @@index([merchantId, createdAt])
+  @@map("webhook_events")
+}
